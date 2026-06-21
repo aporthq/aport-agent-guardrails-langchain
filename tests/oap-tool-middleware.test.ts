@@ -6,8 +6,6 @@
  * fallback strategies, LangChain tool wrapping, and LangGraph node wrapping.
  */
 
-import * as https from 'https';
-import * as http from 'http';
 import {
   OAPToolMiddleware,
   OAPReceiptGenerator,
@@ -17,18 +15,8 @@ import {
   LangGraphNodeFn,
 } from '../src';
 
-// Mock https and http modules
-jest.mock('https');
-jest.mock('http');
-
 describe('OAPToolMiddleware', () => {
-  let mockRequest: jest.Mock;
-  let mockReq: {
-    on: jest.Mock;
-    write: jest.Mock;
-    end: jest.Mock;
-    destroy: jest.Mock;
-  };
+  let mockFetch: jest.Mock;
   let emittedReceipts: OAPReceipt[];
 
   const createMockTool = (name: string): LangChainToolLike => ({
@@ -44,72 +32,44 @@ describe('OAPToolMiddleware', () => {
       nodeExecuted: true,
     }));
 
-  const setupMockResponse = (statusCode: number, body: unknown) => {
-    const mockRes = {
-      statusCode,
-      on: jest.fn((event: string, handler: (chunk?: string) => void) => {
-        if (event === 'data') {
-          handler(JSON.stringify(body));
-        }
-        if (event === 'end') {
-          handler();
-        }
-      }),
-    };
-
-    mockRequest.mockImplementation((_options: unknown, callback: (res: unknown) => void) => {
-      callback(mockRes);
-      return mockReq;
+  const setupMockFetchResponse = (statusCode: number, body: unknown) => {
+    mockFetch.mockResolvedValue({
+      ok: statusCode >= 200 && statusCode < 300,
+      status: statusCode,
+      text: async () => JSON.stringify(body),
     });
   };
 
-  const setupMockError = (errorMessage: string) => {
-    mockRequest.mockImplementation(() => {
-      setTimeout(() => {
-        const errorHandler = mockReq.on.mock.calls.find(
-          (call: [string, (...args: unknown[]) => void]) => call[0] === 'error'
-        )?.[1];
-        if (errorHandler) {
-          errorHandler(new Error(errorMessage));
-        }
-      }, 10);
-      return mockReq;
-    });
+  const setupMockFetchError = (errorMessage: string) => {
+    mockFetch.mockRejectedValue(new Error(errorMessage));
   };
 
-  const setupMockTimeout = () => {
-    mockRequest.mockImplementation(() => {
-      setTimeout(() => {
-        const timeoutHandler = mockReq.on.mock.calls.find(
-          (call: [string, (...args: unknown[]) => void]) => call[0] === 'timeout'
-        )?.[1];
-        if (timeoutHandler) {
-          timeoutHandler();
-        }
-      }, 10);
-      return mockReq;
+  const setupMockFetchTimeout = () => {
+    mockFetch.mockImplementation(() => {
+      return new Promise((_resolve, reject) => {
+        setTimeout(() => {
+          const abortError = new Error('The operation was aborted');
+          abortError.name = 'AbortError';
+          reject(abortError);
+        }, 50);
+      });
     });
   };
 
   beforeEach(() => {
     jest.clearAllMocks();
     emittedReceipts = [];
+    mockFetch = jest.fn();
+    global.fetch = mockFetch;
+  });
 
-    mockReq = {
-      on: jest.fn(),
-      write: jest.fn(),
-      end: jest.fn(),
-      destroy: jest.fn(),
-    };
-
-    mockRequest = jest.fn(() => mockReq);
-    jest.spyOn(https, 'request').mockImplementation(mockRequest as unknown as typeof https.request);
-    jest.spyOn(http, 'request').mockImplementation(mockRequest as unknown as typeof http.request);
+  afterEach(() => {
+    jest.restoreAllMocks();
   });
 
   describe('Test 1: Allow Flow - Tool call permitted when API returns allow', () => {
     it('should allow tool execution when API returns allow: true via invoke()', async () => {
-      setupMockResponse(200, { allow: true, reason: 'Allowed by policy' });
+      setupMockFetchResponse(200, { allow: true, reason: 'Allowed by policy' });
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -126,7 +86,7 @@ describe('OAPToolMiddleware', () => {
     });
 
     it('should allow tool execution via _call() for legacy tools', async () => {
-      setupMockResponse(200, { allow: true, reason: 'Allowed by policy' });
+      setupMockFetchResponse(200, { allow: true, reason: 'Allowed by policy' });
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -143,7 +103,7 @@ describe('OAPToolMiddleware', () => {
 
   describe('Test 2: Deny Flow - Tool call blocked when API returns deny', () => {
     it('should throw OAPAuthorizationError when API returns allow: false', async () => {
-      setupMockResponse(200, { allow: false, reason: 'Tool not permitted' });
+      setupMockFetchResponse(200, { allow: false, reason: 'Tool not permitted' });
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -157,7 +117,7 @@ describe('OAPToolMiddleware', () => {
     });
 
     it('should include denial reason in error message', async () => {
-      setupMockResponse(200, { allow: false, reason: 'Dangerous tool blocked' });
+      setupMockFetchResponse(200, { allow: false, reason: 'Dangerous tool blocked' });
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -183,7 +143,7 @@ describe('OAPToolMiddleware', () => {
 
   describe('Test 3: Network Failure Fallback - Deny (default)', () => {
     it('should deny tool call when API is unreachable and fallback is deny', async () => {
-      setupMockError('ECONNREFUSED');
+      setupMockFetchError('ECONNREFUSED');
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -198,7 +158,7 @@ describe('OAPToolMiddleware', () => {
     });
 
     it('should emit denial receipt on network failure with deny fallback', async () => {
-      setupMockError('ECONNREFUSED');
+      setupMockFetchError('ECONNREFUSED');
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -224,7 +184,7 @@ describe('OAPToolMiddleware', () => {
 
   describe('Test 4: Network Failure Fallback - Allow', () => {
     it('should allow tool call when API is unreachable and fallback is allow', async () => {
-      setupMockError('ECONNREFUSED');
+      setupMockFetchError('ECONNREFUSED');
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -240,7 +200,7 @@ describe('OAPToolMiddleware', () => {
     });
 
     it('should emit approval receipt on network failure with allow fallback', async () => {
-      setupMockError('ECONNREFUSED');
+      setupMockFetchError('ECONNREFUSED');
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -261,7 +221,7 @@ describe('OAPToolMiddleware', () => {
 
   describe('Test 5: Network Failure Fallback - Error', () => {
     it('should throw error when API fails and fallback is error', async () => {
-      setupMockError('ETIMEDOUT');
+      setupMockFetchError('ETIMEDOUT');
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -298,12 +258,12 @@ describe('OAPToolMiddleware', () => {
 
   describe('Test 7: Timeout Handling', () => {
     it('should reject when request times out', async () => {
-      setupMockTimeout();
+      setupMockFetchTimeout();
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
         policy: 'policy-456',
-        timeoutMs: 100,
+        timeoutMs: 10,
         fallbackOnFailure: 'deny',
       });
 
@@ -312,49 +272,26 @@ describe('OAPToolMiddleware', () => {
 
       await expect(guarded.invoke!({})).rejects.toThrow('timed out');
     });
-
-    it('should destroy request on timeout', async () => {
-      setupMockTimeout();
-
-      const middleware = new OAPToolMiddleware({
-        passport: 'passport-123',
-        policy: 'policy-456',
-        timeoutMs: 100,
-        fallbackOnFailure: 'deny',
-      });
-
-      const tool = createMockTool('web_search');
-      const guarded = middleware.wrapTool(tool);
-
-      try {
-        await guarded.invoke!({});
-      } catch {
-        // Expected
-      }
-
-      expect(mockReq.destroy).toHaveBeenCalled();
-    });
   });
 
   describe('Test 8: Async Verification Correctness', () => {
     it('should handle concurrent tool calls independently', async () => {
-      let callCount = 0;
-      mockRequest.mockImplementation((_options: unknown, callback: (res: unknown) => void) => {
-        callCount++;
-        const mockRes = {
-          statusCode: 200,
-          on: jest.fn((event: string, handler: (chunk?: string) => void) => {
-            if (event === 'data') {
-              handler(JSON.stringify({ allow: callCount % 2 === 1, reason: 'test' }));
-            }
-            if (event === 'end') {
-              handler();
-            }
-          }),
-        };
-        callback(mockRes);
-        return mockReq;
-      });
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ allow: true, reason: 'test' }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ allow: false, reason: 'test' }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ allow: true, reason: 'test' }),
+        });
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -379,7 +316,7 @@ describe('OAPToolMiddleware', () => {
 
   describe('Test 9: API Key Authentication', () => {
     it('should include Authorization header when apiKey is provided', async () => {
-      setupMockResponse(200, { allow: true });
+      setupMockFetchResponse(200, { allow: true });
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -390,12 +327,12 @@ describe('OAPToolMiddleware', () => {
       const tool = createMockTool('web_search');
       await middleware.wrapTool(tool).invoke!({});
 
-      const requestOptions = mockRequest.mock.calls[0][0] as { headers: Record<string, string> };
-      expect(requestOptions.headers['Authorization']).toBe('Bearer secret-key-xyz');
+      const requestInit = mockFetch.mock.calls[0][1] as { headers: Record<string, string> };
+      expect(requestInit.headers['Authorization']).toBe('Bearer secret-key-xyz');
     });
 
     it('should not include Authorization header when apiKey is omitted', async () => {
-      setupMockResponse(200, { allow: true });
+      setupMockFetchResponse(200, { allow: true });
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -405,14 +342,14 @@ describe('OAPToolMiddleware', () => {
       const tool = createMockTool('web_search');
       await middleware.wrapTool(tool).invoke!({});
 
-      const requestOptions = mockRequest.mock.calls[0][0] as { headers: Record<string, string> };
-      expect(requestOptions.headers['Authorization']).toBeUndefined();
+      const requestInit = mockFetch.mock.calls[0][1] as { headers: Record<string, string> };
+      expect(requestInit.headers['Authorization']).toBeUndefined();
     });
   });
 
   describe('Test 10: Receipt Emission via Callback', () => {
     it('should emit receipt on allowed tool call', async () => {
-      setupMockResponse(200, { allow: true, reason: 'Permitted' });
+      setupMockFetchResponse(200, { allow: true, reason: 'Permitted' });
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -433,7 +370,7 @@ describe('OAPToolMiddleware', () => {
     });
 
     it('should emit receipt on denied tool call', async () => {
-      setupMockResponse(200, { allow: false, reason: 'Blocked' });
+      setupMockFetchResponse(200, { allow: false, reason: 'Blocked' });
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -456,7 +393,7 @@ describe('OAPToolMiddleware', () => {
 
   describe('Test 11: Receipt Suppression', () => {
     it('should not emit receipts when emitReceipts is false', async () => {
-      setupMockResponse(200, { allow: true });
+      setupMockFetchResponse(200, { allow: true });
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -474,21 +411,10 @@ describe('OAPToolMiddleware', () => {
 
   describe('Test 12: Non-JSON API Response', () => {
     it('should fallback to deny when API returns invalid JSON', async () => {
-      const mockRes = {
-        statusCode: 200,
-        on: jest.fn((event: string, handler: (chunk?: string) => void) => {
-          if (event === 'data') {
-            handler('not valid json');
-          }
-          if (event === 'end') {
-            handler();
-          }
-        }),
-      };
-
-      mockRequest.mockImplementation((_options: unknown, callback: (res: unknown) => void) => {
-        callback(mockRes);
-        return mockReq;
+      mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
+        text: async () => 'not valid json',
       });
 
       const middleware = new OAPToolMiddleware({
@@ -504,21 +430,10 @@ describe('OAPToolMiddleware', () => {
 
   describe('Test 13: Non-2xx API Response', () => {
     it('should fallback when API returns 500', async () => {
-      const mockRes = {
-        statusCode: 500,
-        on: jest.fn((event: string, handler: (chunk?: string) => void) => {
-          if (event === 'data') {
-            handler('Internal Server Error');
-          }
-          if (event === 'end') {
-            handler();
-          }
-        }),
-      };
-
-      mockRequest.mockImplementation((_options: unknown, callback: (res: unknown) => void) => {
-        callback(mockRes);
-        return mockReq;
+      mockFetch.mockResolvedValue({
+        ok: false,
+        status: 500,
+        text: async () => 'Internal Server Error',
       });
 
       const middleware = new OAPToolMiddleware({
@@ -534,7 +449,7 @@ describe('OAPToolMiddleware', () => {
 
   describe('Test 14: Missing Agent Context', () => {
     it('should handle missing agentId in context gracefully', async () => {
-      setupMockResponse(200, { allow: true });
+      setupMockFetchResponse(200, { allow: true });
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -576,7 +491,7 @@ describe('OAPToolMiddleware', () => {
 
   describe('Test 16: Custom API Endpoint', () => {
     it('should use custom apiEndpoint when provided', async () => {
-      setupMockResponse(200, { allow: true });
+      setupMockFetchResponse(200, { allow: true });
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -587,18 +502,14 @@ describe('OAPToolMiddleware', () => {
       const tool = createMockTool('web_search');
       await middleware.wrapTool(tool).invoke!({});
 
-      const requestOptions = mockRequest.mock.calls[0][0] as {
-        hostname: string;
-        path: string;
-      };
-      expect(requestOptions.hostname).toBe('staging.aport.io');
-      expect(requestOptions.path).toBe('/v1/verify');
+      const url = mockFetch.mock.calls[0][0] as string;
+      expect(url).toBe('https://staging.aport.io/v1/verify');
     });
   });
 
   describe('Test 17: HTTP Support (non-HTTPS)', () => {
-    it('should use http module for non-https URLs', async () => {
-      setupMockResponse(200, { allow: true });
+    it('should allow non-https URLs via fetch', async () => {
+      setupMockFetchResponse(200, { allow: true });
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -609,14 +520,14 @@ describe('OAPToolMiddleware', () => {
       const tool = createMockTool('web_search');
       await middleware.wrapTool(tool).invoke!({});
 
-      expect(http.request).toHaveBeenCalled();
-      expect(https.request).not.toHaveBeenCalled();
+      const url = mockFetch.mock.calls[0][0] as string;
+      expect(url).toBe('http://localhost:8080/verify');
     });
   });
 
   describe('Test 18: Callable Tool Wrapping', () => {
     it('should wrap callable tools (tool() decorator results)', async () => {
-      setupMockResponse(200, { allow: true });
+      setupMockFetchResponse(200, { allow: true });
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -636,7 +547,7 @@ describe('OAPToolMiddleware', () => {
     });
 
     it('should block callable tools when denied', async () => {
-      setupMockResponse(200, { allow: false, reason: 'Blocked' });
+      setupMockFetchResponse(200, { allow: false, reason: 'Blocked' });
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -655,7 +566,7 @@ describe('OAPToolMiddleware', () => {
 
   describe('Test 19: LangGraph Node Wrapping', () => {
     it('should allow LangGraph node execution when API returns allow', async () => {
-      setupMockResponse(200, { allow: true });
+      setupMockFetchResponse(200, { allow: true });
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -671,7 +582,7 @@ describe('OAPToolMiddleware', () => {
     });
 
     it('should deny LangGraph node execution when API returns deny', async () => {
-      setupMockResponse(200, { allow: false, reason: 'Node blocked' });
+      setupMockFetchResponse(200, { allow: false, reason: 'Node blocked' });
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -685,7 +596,7 @@ describe('OAPToolMiddleware', () => {
     });
 
     it('should extract tool call args from LangGraph state with messages', async () => {
-      setupMockResponse(200, { allow: true });
+      setupMockFetchResponse(200, { allow: true });
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',
@@ -707,15 +618,15 @@ describe('OAPToolMiddleware', () => {
 
       await guardedNode(state, {});
 
-      const writeCall = mockReq.write.mock.calls[0]?.[0];
-      const payload = JSON.parse(writeCall);
+      const requestInit = mockFetch.mock.calls[0][1] as { body: string };
+      const payload = JSON.parse(requestInit.body);
       expect(payload.args.query).toBe('LangChain');
     });
   });
 
   describe('Test 20: Tool properties preserved after wrapping', () => {
     it('should preserve original tool name and description', async () => {
-      setupMockResponse(200, { allow: true });
+      setupMockFetchResponse(200, { allow: true });
 
       const middleware = new OAPToolMiddleware({
         passport: 'passport-123',

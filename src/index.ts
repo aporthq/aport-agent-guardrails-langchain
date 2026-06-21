@@ -37,4 +37,4 @@ export {
 } from './types';
 
 // Re-export for convenience
-export { OAPAuthorizationError as default } from './types';
+export { OAPToolMiddleware as default } from './oap-tool-middleware';

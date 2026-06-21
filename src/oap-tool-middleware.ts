@@ -7,9 +7,7 @@
  * @module @aporthq/aport-agent-guardrails-langchain
  */
 
-import * as https from 'https';
-import * as http from 'http';
-import { URL } from 'url';
+
 import {
   LangChainAgentContext,
   OAPVerifyRequest,
@@ -180,7 +178,7 @@ export class OAPToolMiddleware {
         await this.authorizeToolCall(toolName, args, agentContext);
         return (tool as unknown as (input: unknown, config?: unknown) => Promise<unknown>)(input, config);
       };
-      // Copy properties from original tool to callable wrapper
+      // Copy enumerable properties from original tool to callable wrapper
       Object.keys(tool).forEach((key) => {
         try {
           (callableWrapper as unknown as Record<string, unknown>)[key] = (tool as unknown as Record<string, unknown>)[key];
@@ -188,6 +186,16 @@ export class OAPToolMiddleware {
           // Ignore read-only property errors
         }
       });
+      // Preserve non-enumerable .name explicitly
+      const originalName = (tool as unknown as Record<string, unknown>).name;
+      try {
+        Object.defineProperty(callableWrapper as unknown as Record<string, unknown>, 'name', {
+          value: originalName,
+          configurable: true,
+        });
+      } catch {
+        // Ignore if name cannot be set
+      }
       return callableWrapper as unknown as T;
     }
 
@@ -448,71 +456,53 @@ export class OAPToolMiddleware {
   }
 
   /**
-   * Perform an HTTP POST with JSON payload
+   * Perform an HTTP POST with JSON payload using native fetch.
+   * Compatible with Node 18+, Cloudflare Workers, Deno, Bun, and browsers.
    */
-  private postJSON<T>(url: string, payload: unknown): Promise<T> {
-    return new Promise((resolve, reject) => {
-      const parsedUrl = new URL(url);
-      const isHttps = parsedUrl.protocol === 'https:';
-      const client = isHttps ? https : http;
+  private async postJSON<T>(url: string, payload: unknown): Promise<T> {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
 
-      const postData = JSON.stringify(payload);
+    if (this.apiKey) {
+      headers['Authorization'] = `Bearer ${this.apiKey}`;
+    }
 
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(postData).toString(),
-      };
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
 
-      if (this.apiKey) {
-        headers['Authorization'] = `Bearer ${this.apiKey}`;
-      }
-
-      const options: http.RequestOptions = {
-        hostname: parsedUrl.hostname,
-        port: parsedUrl.port || (isHttps ? 443 : 80),
-        path: parsedUrl.pathname + parsedUrl.search,
+    try {
+      const response = await fetch(url, {
         method: 'POST',
         headers,
-        timeout: this.timeoutMs,
-      };
-
-      const req = client.request(options, (res) => {
-        let data = '';
-
-        res.on('data', (chunk) => {
-          data += chunk;
-        });
-
-        res.on('end', () => {
-          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-            try {
-              const parsed = JSON.parse(data) as T;
-              resolve(parsed);
-            } catch (parseError) {
-              reject(new Error(`Invalid JSON response: ${data}`));
-            }
-          } else {
-            reject(
-              new Error(
-                `OAP API returned ${res.statusCode}: ${data || 'No response body'}`
-              )
-            );
-          }
-        });
+        body: JSON.stringify(payload),
+        signal: controller.signal,
       });
 
-      req.on('error', (error) => {
-        reject(new Error(`Request failed: ${error.message}`));
-      });
+      clearTimeout(timeoutId);
 
-      req.on('timeout', () => {
-        req.destroy();
-        reject(new Error(`Request timed out after ${this.timeoutMs}ms`));
-      });
+      const data = await response.text();
 
-      req.write(postData);
-      req.end();
-    });
+      if (!response.ok) {
+        throw new Error(
+          `OAP API returned ${response.status}: ${data || 'No response body'}`
+        );
+      }
+
+      try {
+        return JSON.parse(data) as T;
+      } catch {
+        throw new Error(`Invalid JSON response: ${data}`);
+      }
+    } catch (error) {
+      clearTimeout(timeoutId);
+
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new Error(`Request timed out after ${this.timeoutMs}ms`);
+      }
+
+      throw error;
+    }
   }
 
   /**
